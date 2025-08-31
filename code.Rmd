@@ -1,0 +1,2130 @@
+---
+title: "Mathematical Approaches to Multiple Life Insurance and Their Applications"
+author: "LSCC6"
+date: "2025-06-29"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+# Mortality Model Fitting and Insurance Pricing
+
+```{r data-preparation, message=FALSE, warning=FALSE}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+})
+
+# Configuration
+train_years <- 2013:2017
+test_years  <- 2018:2022
+max_age     <- 100
+eps         <- 1e-12
+CLIP        <- 50
+
+female_file <- "fltper_1x1.txt"
+male_file   <- "mltper_1x1.txt"
+
+age_segments <- list(
+  `Infant (0-1)`   = 0:1,
+  `Child (2-14)`   = 2:14,
+  `Youth (15-24)`  = 15:24,
+  `Adult (25-64)`  = 25:64,
+  `Senior (65-84)` = 65:84,
+  `Elderly (85+)`  = 85:100
+)
+
+if (!exists("create_age_groups")) {
+  create_age_groups <- function(age){
+    cut(as.numeric(age),
+        breaks = c(-Inf, 1, 14, 24, 64, 84, Inf),
+        labels = c("Infant (0-1)", "Child (2-14)", "Youth (15-24)",
+                   "Adult (25-64)", "Senior (65-84)", "Elderly (85+)"),
+        right = TRUE)
+  }
+}
+
+# Helper functions
+safe_rmse <- function(obs, pred){
+  ok <- is.finite(obs) & is.finite(pred)
+  if (!any(ok)) return(NA_real_)
+  sqrt(mean((obs[ok]-pred[ok])^2))
+}
+
+safe_mae <- function(obs, pred){
+  ok <- is.finite(obs) & is.finite(pred)
+  if (!any(ok)) return(NA_real_)
+  mean(abs(obs[ok]-pred[ok]))
+}
+
+weighted_rmse_grid <- function(D, E, mhat, eps=1e-12){
+  mx_obs <- D / pmax(E, eps)
+  w      <- E / sum(E, na.rm=TRUE)
+  sqrt(sum(w * (mx_obs - mhat)^2, na.rm=TRUE))
+}
+
+AIC_from_nll  <- function(nll, k) 2*k + 2*nll
+
+safe_poisson_nll <- function(Dx, Ex, mhat){
+  mhat   <- pmax(mhat, eps)
+  log_mu <- log(pmax(Ex, eps)) + pmin(pmax(log(mhat), -CLIP), CLIP)
+  mu     <- exp(log_mu)
+  val <- -sum(Dx * log_mu - mu - lgamma(Dx + 1), na.rm = TRUE)
+  if (!is.finite(val)) .Machine$double.xmax/100 else val
+}
+
+safe_optim2 <- function(par0, fn_lbfgs, lower=NULL, upper=NULL,
+                        ctrl1=list(maxit=30000, pgtol=1e-8),
+                        fn_nm=NULL, ctrl2=list(maxit=60000, reltol=1e-10)) {
+  if (any(!is.finite(par0))) par0[!is.finite(par0)] <- 0
+  res <- tryCatch(
+    optim(par0, fn_lbfgs, method="L-BFGS-B", lower=lower, upper=upper, control=ctrl1),
+    error=function(e) NULL
+  )
+  if (is.null(res) || !is.finite(res$value) || res$convergence != 0) {
+    if (is.null(fn_nm)) fn_nm <- fn_lbfgs
+    res <- optim(par0, fn_nm, method="Nelder-Mead", control=ctrl2)
+  }
+  res
+}
+
+# Data preparation
+prepare_data <- function(file_path){
+  df <- read_table2(
+    file_path, skip = 2,
+    col_types = cols(
+      Year = col_integer(), Age = col_character(), mx = col_double(),
+      qx = col_double(), ax = col_double(), lx = col_double(),
+      dx = col_double(), Lx = col_double(), Tx = col_double(), ex = col_double()
+    )
+  ) |>
+    mutate(Age = readr::parse_number(Age)) |>
+    filter(Age <= max_age)
+
+  # Training matrix
+  train <- df |>
+    filter(Year %in% train_years) |>
+    transmute(Age = as.integer(Age), Year, dx = dx, Lx = Lx) |>
+    group_by(Age, Year) |>
+    summarise(dx = sum(dx, na.rm = TRUE), Lx = sum(Lx, na.rm = TRUE), .groups = "drop") |>
+    complete(Age = 0:max_age, Year = train_years, fill = list(dx = 0, Lx = NA_real_)) |>
+    arrange(Year, Age)
+
+  D_train <- matrix(train$dx, nrow = max_age+1, ncol = length(train_years))
+  E_train <- matrix(train$Lx, nrow = max_age+1, ncol = length(train_years))
+  rownames(D_train) <- rownames(E_train) <- as.character(0:max_age)
+  colnames(D_train) <- colnames(E_train) <- as.character(train_years)
+  E_train[!is.finite(E_train) | E_train <= 0] <- 1e-12
+
+  # Test matrix
+  test <- df |>
+    filter(Year %in% test_years) |>
+    transmute(Age = as.integer(Age), Year, dx = dx, Lx = Lx) |>
+    group_by(Age, Year) |>
+    summarise(dx = sum(dx, na.rm = TRUE), Lx = sum(Lx, na.rm = TRUE), .groups = "drop") |>
+    complete(Age = 0:max_age, Year = test_years, fill = list(dx = 0, Lx = NA_real_)) |>
+    arrange(Year, Age)
+
+  D_test <- matrix(test$dx, nrow = max_age+1, ncol = length(test_years))
+  E_test <- matrix(test$Lx, nrow = max_age+1, ncol = length(test_years))
+  rownames(D_test) <- rownames(E_test) <- as.character(0:max_age)
+  colnames(D_test) <- colnames(E_test) <- as.character(test_years)
+  E_test[!is.finite(E_test) | E_test <= 0] <- 1e-12
+
+  list(D_train=D_train, E_train=E_train, D_test=D_test, E_test=E_test,
+       ages=0:max_age, years_tr=train_years, years_te=test_years)
+}
+
+# Four models with year-intercept grid
+fit_gomp_year_grid <- function(D, E, ages, years){
+  A <- length(ages); Tt <- length(years)
+  obj <- function(par){
+    logB <- par[1]; logc <- par[2]; k_free <- par[-(1:2)]
+    kt <- c(k_free, -sum(k_free))
+    eta_age  <- logB + ages * logc
+    log_mhat <- outer(eta_age, rep(1,Tt)) + matrix(rep(kt, each=A), A, Tt)
+    safe_poisson_nll(D, E, exp(log_mhat))
+  }
+  Dx <- rowSums(D); Ex <- rowSums(E); mx <- Dx/pmax(Ex, 1e-12); ok <- is.finite(mx) & mx>0
+  if (sum(ok)>=2){
+    lm0 <- lm(log(mx[ok]) ~ ages[ok]); par0 <- c(lm0$coef[1], lm0$coef[2], rep(0, Tt-1))
+  } else par0 <- c(log(1e-5), log(1.05), rep(0, Tt-1))
+  lower <- c(log(1e-12), log(1.001), rep(-Inf, Tt-1))
+  upper <- c(log(1),     log(1.5),   rep( Inf, Tt-1))
+  opt <- safe_optim2(par0, obj, lower, upper); k <- 2 + (Tt - 1)
+  p <- opt$par; logB <- p[1]; logc <- p[2]; k_free <- p[-(1:2)]; kt <- c(k_free, -sum(k_free))
+  eta_age <- logB + ages*logc
+  log_mhat <- outer(eta_age, rep(1,Tt)) + matrix(rep(kt, each=A), A, Tt)
+  list(
+    nll=obj(opt$par), k=k, mhat=exp(pmin(pmax(log_mhat,-50),50)),
+    params = list(gompertz = c(B = exp(logB), c = exp(logc)))
+  )
+}
+
+fit_make_year_grid <- function(D, E, ages, years){
+  A <- length(ages); Tt <- length(years)
+  obj <- function(par){
+    logA <- par[1]; logB <- par[2]; logc <- par[3]; k_free <- par[-(1:3)]
+    A0 <- exp(logA); B0 <- exp(logB); c0 <- exp(logc)
+    m_age <- pmax(A0 + B0 * (c0^ages), 1e-12)
+    kt <- c(k_free, -sum(k_free))
+    log_mhat <- log(m_age) + matrix(rep(kt, each=A), A, Tt)
+    safe_poisson_nll(D, E, exp(log_mhat))
+  }
+  Dx <- rowSums(D); Ex <- rowSums(E); mx <- Dx/pmax(Ex, 1e-12); ok <- is.finite(mx) & mx>0
+  if (sum(ok)>=2){
+    lm0 <- lm(log(mx[ok]) ~ ages[ok]); par0 <- c(log(1e-6), lm0$coef[1], lm0$coef[2], rep(0, Tt-1))
+  } else par0 <- c(log(1e-6), log(1e-5), log(1.05), rep(0, Tt-1))
+  lower <- c(log(1e-12), log(1e-12), log(1.001), rep(-Inf, Tt-1))
+  upper <- c(log(0.1),   log(1),     log(1.5),   rep( Inf, Tt-1))
+  opt <- safe_optim2(par0, obj, lower, upper); k <- 3 + (Tt - 1)
+  p <- opt$par; A0 <- exp(p[1]); B0 <- exp(p[2]); c0 <- exp(p[3]); k_free <- p[-(1:3)]
+  m_age <- pmax(A0 + B0 * (c0^ages), 1e-12); kt <- c(k_free, -sum(k_free))
+  log_mhat <- log(m_age) + matrix(rep(kt, each=A), A, Tt)
+  list(
+    nll=obj(opt$par), k=k, mhat=exp(pmin(pmax(log_mhat,-50),50)),
+    params = list(makeham = c(A = A0, B = B0, c = c0))
+  )
+}
+
+fit_hp_year_grid <- function(D, E, ages, years){
+  A <- length(ages); Tt <- length(years)
+  obj <- function(p){
+    A1 <- exp(p[1]); B1 <- p[2]; C1 <- exp(p[3]); D1 <- exp(p[4])
+    E1 <- exp(p[5]); F1 <- exp(p[6]); G1 <- exp(p[7]); k_free <- p[-(1:7)]
+    age1 <- pmax(ages, 0.1)
+    m_age <- exp((age1 + B1) * log(pmax(A1, 1e-12))) +
+             C1 * exp(-D1 * (log(age1) - log(E1))^2) +
+             exp(log(pmax(F1, 1e-12)) + age1 * log(pmax(G1, 1e-12)))
+    m_age <- pmax(m_age, 1e-12)
+    kt <- c(k_free, -sum(k_free))
+    log_mhat <- log(m_age) + matrix(rep(kt, each=A), A, Tt)
+    safe_poisson_nll(D, E, exp(log_mhat))
+  }
+  p0 <- c(log(2e-4), -0.5, log(0.01), log(5), log(25), log(1e-5), log(1.08), rep(0, Tt-1))
+  opt <- safe_optim2(p0, obj); k <- 7 + (Tt - 1)
+  p <- opt$par; A1 <- exp(p[1]); B1 <- p[2]; C1 <- exp(p[3]); D1 <- exp(p[4])
+  E1 <- exp(p[5]); F1 <- exp(p[6]); G1 <- exp(p[7]); k_free <- p[-(1:7)]
+  age1 <- pmax(ages, 0.1)
+  m_age <- exp((age1 + B1) * log(pmax(A1, 1e-12))) +
+           C1 * exp(-D1 * (log(age1) - log(E1))^2) +
+           exp(log(pmax(F1, 1e-12)) + age1 * log(pmax(G1, 1e-12)))
+  kt <- c(k_free, -sum(k_free))
+  log_mhat <- log(pmax(m_age, 1e-12)) + matrix(rep(kt, each=A), A, Tt)
+  list(
+    nll=obj(opt$par), k=k, mhat=exp(pmin(pmax(log_mhat,-50),50)),
+    params = list(hp = c(A=A1, B=B1, C=C1, D=D1, E=E1, F=F1, G=G1))
+  )
+}
+
+fit_weibull_year_grid <- function(D, E, ages, years){
+  A <- length(ages); Tt <- length(years)
+  obj <- function(par){
+    log_lambda <- par[1]; log_k <- par[2]; k_free <- par[-(1:2)]
+    lambda <- exp(log_lambda); k_param <- exp(log_k)
+    age1 <- pmax(ages, 0.1)
+    m_age <- lambda * k_param * (lambda * age1)^(k_param - 1)
+    m_age <- pmax(m_age, 1e-12)
+    kt <- c(k_free, -sum(k_free))
+    log_mhat <- log(m_age) + matrix(rep(kt, each=A), A, Tt)
+    safe_poisson_nll(D, E, exp(log_mhat))
+  }
+  Dx <- rowSums(D); Ex <- rowSums(E); mx <- Dx/pmax(Ex, 1e-12); ok <- is.finite(mx) & mx>0
+  if (sum(ok)>=2){
+    lm0 <- lm(log(mx[ok]) ~ ages[ok])
+    lambda_init <- exp(lm0$coef[1]); k_init <- max(0.5, 1 + lm0$coef[2])
+    par0 <- c(log(lambda_init), log(k_init), rep(0, Tt-1))
+  } else par0 <- c(log(0.01), log(1.5), rep(0, Tt-1))
+  lower <- c(log(1e-6), log(0.1), rep(-Inf, Tt-1))
+  upper <- c(log(1),    log(5),   rep( Inf, Tt-1))
+  opt <- safe_optim2(par0, obj, lower, upper); k <- 2 + (Tt - 1)
+  p <- opt$par; log_lambda <- p[1]; log_k <- p[2]; k_free <- p[-(1:2)]
+  lambda <- exp(log_lambda); k_param <- exp(log_k)
+  age1 <- pmax(ages, 0.1)
+  m_age <- lambda * k_param * (lambda * age1)^(k_param - 1)
+  kt <- c(k_free, -sum(k_free))
+  log_mhat <- log(pmax(m_age, 1e-12)) + matrix(rep(kt, each=A), A, Tt)
+  list(
+    nll=obj(opt$par), k=k, mhat=exp(pmin(pmax(log_mhat,-50),50)),
+    params = list(weibull = c(lambda = lambda, k = k_param))
+  )
+}
+
+# Segment parameter storage for pricing
+.seg_param_store <- new.env(parent = emptyenv())
+
+register_segment_params <- function(gender, segment, model_name, params_list){
+  key <- paste0(ifelse(is.null(gender), "All", gender), "::", segment)
+  .seg_param_store[[key]] <- list(model = model_name, params = params_list)
+}
+
+get_segment_params <- function(age, gender){
+  seg <- as.character(create_age_groups(age))
+  key <- paste0(if (is.null(gender)) "All" else gender, "::", seg)
+  if (exists(key, envir = .seg_param_store)) get(key, envir = .seg_param_store) else NULL
+}
+
+reset_segment_params <- function(){
+  rm(list = ls(envir = .seg_param_store), envir = .seg_param_store)
+}
+
+fit_one_segment <- function(dat, seg_name, seg_ages, gender_label = NULL){
+  ages_all  <- dat$ages
+  idx <- which(ages_all %in% seg_ages)
+  if (length(idx) == 0) return(NULL)
+
+  Dtr <- dat$D_train[idx,, drop=FALSE]; Etr <- dat$E_train[idx,, drop=FALSE]
+  Dte <- dat$D_test[idx,,  drop=FALSE]; Ete <- dat$E_test[idx,,  drop=FALSE]
+  ages <- ages_all[idx]; years_tr <- dat$years_tr; years_te <- dat$years_te
+
+  g <- fit_gomp_year_grid   (Dtr, Etr, ages, years_tr)
+  m <- fit_make_year_grid   (Dtr, Etr, ages, years_tr)
+  h <- fit_hp_year_grid     (Dtr, Etr, ages, years_tr)
+  w <- fit_weibull_year_grid(Dtr, Etr, ages, years_tr)
+  models <- list(Gompertz=g, Makeham=m, `Heligman-Pollard`=h, Weibull=w)
+
+  tr_rows <- purrr::imap_dfr(models, function(obj, nm){
+    AIC <- AIC_from_nll(obj$nll, obj$k)
+    tibble(
+      Model      = nm,
+      N_Params   = obj$k,
+      Train_RMSE = weighted_rmse_grid(Dtr, Etr, obj$mhat),
+      Train_AIC  = AIC
+    )
+  })
+
+  pred_age <- function(mhat){
+    rowSums(Ete * (rowMeans(mhat) %o% rep(1, ncol(Ete)))) / pmax(rowSums(Ete), 1e-12)
+  }
+  obs_te_age <- rowSums(Dte) / pmax(rowSums(Ete), 1e-12)
+  te_rows <- tibble(
+    Model     = names(models),
+    Test_RMSE = c(
+      safe_rmse(obs_te_age, pred_age(g$mhat)),
+      safe_rmse(obs_te_age, pred_age(m$mhat)),
+      safe_rmse(obs_te_age, pred_age(h$mhat)),
+      safe_rmse(obs_te_age, pred_age(w$mhat))
+    ),
+    Test_MAE  = c(
+      safe_mae(obs_te_age, pred_age(g$mhat)),
+      safe_mae(obs_te_age, pred_age(m$mhat)),
+      safe_mae(obs_te_age, pred_age(h$mhat)),
+      safe_mae(obs_te_age, pred_age(w$mhat))
+    )
+  )
+
+  out <- tr_rows %>%
+    left_join(te_rows, by = "Model") %>%
+    mutate(Segment = seg_name, .before = 1) %>%
+    relocate(Segment, Model, N_Params, Train_RMSE, Train_AIC, Test_RMSE, Test_MAE) %>%
+    arrange(Train_AIC) %>%
+    mutate(Best = if_else(Train_AIC == min(Train_AIC, na.rm = TRUE), "★", ""))
+
+  # Register best model parameters for segment pricing
+  best_name <- out %>% slice_min(Train_AIC, n = 1, with_ties = FALSE) %>% pull(Model)
+  best_obj  <- models[[best_name]]
+  best_params <- best_obj$params
+  std_model_name <- dplyr::recode(best_name, "Heligman-Pollard" = "Heligman_Pollard")
+  register_segment_params(gender_label, seg_name, std_model_name, best_params)
+
+  out
+}
+
+# Runner for a gender
+run_for_gender <- function(file_path, gender_label){
+  dat <- prepare_data(file_path)
+
+  # Fit each segment
+  res_list <- purrr::imap(age_segments, ~ fit_one_segment(dat, .y, .x, gender_label = gender_label))
+  seg_tbl  <- bind_rows(res_list) %>% mutate(Gender = gender_label, .before = 1)
+
+  winners  <- seg_tbl %>%
+    group_by(Segment) %>%
+    slice_min(order_by = Train_AIC, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(Gender, Segment, Best_Model = Model,
+              Train_AIC, N_Params, Test_RMSE, Test_MAE)
+
+  list(all = seg_tbl, best = winners)
+}
+
+# Run and save
+reset_segment_params()   
+female_res <- run_for_gender(female_file, "Female")
+male_res   <- run_for_gender(male_file,   "Male")
+
+seg_metrics <- bind_rows(female_res$all,  male_res$all)
+seg_best    <- bind_rows(female_res$best, male_res$best)
+if (exists("reset_model_map_cache")) reset_model_map_cache()
+
+print(
+  seg_metrics %>%
+    group_by(Gender, Segment) %>%
+    arrange(Test_RMSE, .by_group = TRUE) %>%
+    mutate(across(c(Train_RMSE, Train_AIC, Test_RMSE, Test_MAE), ~round(., 6))) %>%
+    ungroup()
+)
+
+print(
+  seg_best %>%
+    arrange(Gender, Segment) %>%
+    mutate(across(c(Train_AIC, Test_RMSE, Test_MAE), ~round(., 6)))
+)
+
+write_csv(seg_metrics, "segment_model_metrics.csv")
+write_csv(seg_best,    "segment_best_models.csv")
+```
+
+
+```{r}
+
+segment_mid_age <- function(v) floor(mean(range(v)))
+
+.default_param_names <- function(model){
+  if (model == "Gompertz")            return(c("B","c"))
+  if (model == "Makeham")             return(c("A","B","c"))
+  if (model == "Weibull")             return(c("lambda","k"))
+  if (model == "Heligman_Pollard")    return(c("A","B","C","D","E","F","G"))
+  return(character(0))
+}
+
+.extract_vals <- function(model, params){
+  key <- switch(model,
+    "Gompertz" = "gompertz", "Makeham" = "makeham",
+    "Weibull" = "weibull", "Heligman_Pollard" = "hp", NULL
+  )
+  vals <- NULL
+  if (!is.null(key) && !is.null(params[[key]])) vals <- params[[key]]
+  if (is.null(vals) && length(params) >= 1)     vals <- params[[1]]  # 再退路
+  v <- suppressWarnings(as.numeric(vals))
+  nm <- names(vals)
+  if (is.null(nm) || any(is.na(nm)) || any(nm == "")) {
+
+    nm_def <- .default_param_names(model)
+    if (length(nm_def) == length(v)) nm <- nm_def else nm <- paste0("p", seq_along(v))
+  }
+  names(v) <- nm
+  v
+}
+
+.stringify_params <- function(model, params){
+  v <- .extract_vals(model, params)
+  if (length(v) == 0) return(NA_character_)
+  paste(paste(names(v), signif(v, 7), sep="="), collapse="; ")
+}
+
+export_best_params_compact <- function(out_csv = "segment_best_params_compact.csv"){
+  seg_names <- names(age_segments)
+  genders   <- c("Female","Male")
+  rows <- list()
+  for (g in genders){
+    for (s in seg_names){
+      ages <- age_segments[[s]]
+      mid  <- segment_mid_age(ages)
+      entry <- get_segment_params(mid, g) 
+      model <- if (is.null(entry)) NA_character_ else entry$model
+      params_str <- if (is.null(entry)) NA_character_ else .stringify_params(model, entry$params)
+      rows[[length(rows)+1]] <- data.frame(
+        Gender=g, Segment=s, MidAge=mid, Model=model, Params=params_str,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  df <- do.call(rbind, rows)
+  write.csv(df, out_csv, row.names = FALSE)
+  message('Exported: "', out_csv, '"')
+  df
+}
+
+best_compact <- export_best_params_compact()
+head(best_compact, 10)
+
+export_best_params_long_nonNA <- function(){
+  seg_names <- names(age_segments); genders <- c("Female","Male")
+  rows <- list()
+  for (g in genders){
+    for (s in seg_names){
+      mid  <- floor(mean(range(age_segments[[s]])))
+      entry <- get_segment_params(mid, g)
+      if (is.null(entry)) next
+      vals <- .extract_vals(entry$model, entry$params)
+      for (k in seq_along(vals)){
+        rows[[length(rows)+1]] <- data.frame(
+          Gender=g, Segment=s, MidAge=mid, Model=entry$model,
+          Param=names(vals)[k], Value=as.numeric(vals[k]),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  df <- if (length(rows)) do.call(rbind, rows) else data.frame()
+  write.csv(df, "segment_best_params_long_nonNA.csv", row.names = FALSE)
+  message('Exported: "segment_best_params_long_nonNA.csv"')
+  df
+}
+
+# best_long_nonNA <- export_best_params_long_nonNA()
+```
+
+```{r}
+# Additional visualization code to generate the mortality analysis plots
+suppressPackageStartupMessages({
+  library(gridExtra)
+  library(scales)
+})
+
+# Prepare combined data for visualization
+prepare_viz_data <- function(){
+  # Read and prepare female data
+  female_df <- read_table2(
+    female_file, skip = 2,
+    col_types = cols(
+      Year = col_integer(), Age = col_character(), mx = col_double(),
+      qx = col_double(), ax = col_double(), lx = col_double(),
+      dx = col_double(), Lx = col_double(), Tx = col_double(), ex = col_double()
+    )
+  ) |>
+    mutate(Age = readr::parse_number(Age), Gender = "Female") |>
+    filter(Age <= max_age, Year %in% train_years)
+  
+  # Read and prepare male data
+  male_df <- read_table2(
+    male_file, skip = 2,
+    col_types = cols(
+      Year = col_integer(), Age = col_character(), mx = col_double(),
+      qx = col_double(), ax = col_double(), lx = col_double(),
+      dx = col_double(), Lx = col_double(), Tx = col_double(), ex = col_double()
+    )
+  ) |>
+    mutate(Age = readr::parse_number(Age), Gender = "Male") |>
+    filter(Age <= max_age, Year %in% train_years)
+  
+  # Combine datasets
+  combined_df <- bind_rows(female_df, male_df) |>
+    mutate(
+      Age_Group = create_age_groups(Age),
+      Mortality_Rate = mx
+    ) |>
+    filter(!is.na(Age_Group), is.finite(Mortality_Rate), Mortality_Rate > 0)
+  
+  return(combined_df)
+}
+
+# Generate the four-panel plot
+generate_mortality_plots <- function(){
+  viz_data <- prepare_viz_data()
+  
+  # Plot 1: Mortality Rate by Age Group Gender Comparison (Box plot)
+  p1 <- viz_data |>
+    mutate(Age_Group = factor(Age_Group, levels = c("Infant (0-1)", "Child (2-14)", "Youth (15-24)", 
+                                                   "Adult (25-64)", "Senior (65-84)", "Elderly (85+)"))) |>
+    ggplot(aes(x = Age_Group, y = Mortality_Rate, fill = Gender)) +
+    geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+    scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    scale_fill_manual(values = c("Female" = "#E91E63", "Male" = "#2196F3")) +
+    labs(
+      title = "Mortality Rate by Age Group Gender Comparison",
+      x = "Age Group",
+      y = "Mortality Rate"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8),
+      axis.title = element_text(size = 9),
+      legend.position = "right",
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9),
+      plot.title = element_text(size = 10, hjust = 0.5)
+    )
+  
+  # Plot 2: Life Expectancy and Gender Difference Trends
+  life_exp_data <- viz_data |>
+    group_by(Year, Gender) |>
+    summarise(Life_Expectancy = first(ex), .groups = "drop") |>
+    pivot_wider(names_from = Gender, values_from = Life_Expectancy) |>
+    mutate(Gender_Difference = Female - Male) |>
+    pivot_longer(cols = c(Female, Male, Gender_Difference), 
+                 names_to = "Indicator", values_to = "Value")
+  
+  p2 <- life_exp_data |>
+    ggplot(aes(x = Year, y = Value, color = Indicator)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 2) +
+    scale_color_manual(values = c("Female" = "#E91E63", "Male" = "#2196F3", 
+                                 "Gender_Difference" = "#4CAF50")) +
+    scale_x_continuous(breaks = train_years) +
+    labs(
+      title = "Life Expectancy at Gender Difference Trends",
+      x = "Year",
+      y = "Life Expectancy (years)"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 8),
+      axis.title = element_text(size = 9),
+      legend.position = "right",
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9),
+      plot.title = element_text(size = 10, hjust = 0.5)
+    )
+  
+  # Plot 3: Age-Specific Mortality Rate Gender Comparison
+  age_specific_data <- viz_data |>
+    group_by(Age, Gender) |>
+    summarise(Avg_Mortality = mean(Mortality_Rate, na.rm = TRUE), .groups = "drop") |>
+    filter(is.finite(Avg_Mortality), Avg_Mortality > 0)
+  
+  p3 <- age_specific_data |>
+    ggplot(aes(x = Age, y = Avg_Mortality, color = Gender)) +
+    geom_line(size = 1) +
+    scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    scale_color_manual(values = c("Female" = "#E91E63", "Male" = "#2196F3")) +
+    labs(
+      title = "Age-Specific Mortality Rate Gender Comparison",
+      x = "Age",
+      y = "Mortality Rate"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 8),
+      axis.title = element_text(size = 9),
+      legend.position = "right",
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9),
+      plot.title = element_text(size = 10, hjust = 0.5)
+    )
+  
+  # Plot 4: Mortality Rate Gender Ratio (Male/Female)
+  ratio_data <- viz_data |>
+    select(Year, Age, Gender, Mortality_Rate) |>
+    pivot_wider(names_from = Gender, values_from = Mortality_Rate) |>
+    mutate(Mortality_Ratio = Male / Female) |>
+    filter(is.finite(Mortality_Ratio), Mortality_Ratio > 0)
+  
+  p4 <- ratio_data |>
+    ggplot(aes(x = Age, y = Mortality_Ratio, color = factor(Year))) +
+    geom_line(alpha = 0.8, size = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "#E91E63", alpha = 0.7) +
+    scale_color_viridis_d(name = "Year") +
+    ylim(0.8, 3.2) +
+    labs(
+      title = "Mortality Rate Gender Ratio (Male/Female)",
+      x = "Age",
+      y = "Mortality Rate Ratio"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 8),
+      axis.title = element_text(size = 9),
+      legend.position = "right",
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9),
+      plot.title = element_text(size = 10, hjust = 0.5)
+    )
+  
+  # Combine all plots
+  combined_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+  
+  return(combined_plot)
+}
+
+# Generate and save the plots
+cat("\n=== Generating Mortality Analysis Visualization ===\n")
+mortality_plots <- generate_mortality_plots()
+
+# Save the plot
+ggsave("mortality_analysis_plots.png", plot = mortality_plots, 
+       width = 14, height = 10, dpi = 300, bg = "white")
+cat('Exported: "UK_mortality_combined_analysis.png"\n')
+```
+
+# 5-fold Cross-Validation
+
+```{r}
+# 5-fold CV on training years (2013–2017): leave-one-year-out
+
+fit_one_segment_cv <- function(dat, seg_name, seg_ages, cv_years = train_years){
+  ages_all  <- dat$ages
+  idx <- which(ages_all %in% seg_ages)
+  if (length(idx) == 0) return(NULL)
+
+  ages <- ages_all[idx]
+
+  # Age-specific validation metrics from matrices
+  obs_age_from <- function(Dv, Ev){
+    rowSums(Dv) / pmax(rowSums(Ev), eps)
+  }
+  # Predict age rates using training mhat weighted by validation exposure
+  pred_age_from <- function(mhat_train, E_val){
+    rowSums(E_val * (rowMeans(mhat_train) %o% rep(1, ncol(E_val)))) / pmax(rowSums(E_val), eps)
+  }
+
+  # Fit each left-out year as one fold
+  fold_rows <- purrr::map_dfr(cv_years, function(val_y){
+    tr_years <- setdiff(cv_years, val_y)
+
+    # Extract sub-matrices
+    Dtr <- dat$D_train[idx, match(tr_years, colnames(dat$D_train)), drop=FALSE]
+    Etr <- dat$E_train[idx, match(tr_years, colnames(dat$E_train)), drop=FALSE]
+    Dv  <- dat$D_train[idx, match(val_y,   colnames(dat$D_train)), drop=FALSE]
+    Ev  <- dat$E_train[idx, match(val_y,   colnames(dat$E_train)), drop=FALSE]
+
+    # Fit four models
+    g <- fit_gomp_year_grid   (Dtr, Etr, ages, tr_years)
+    m <- fit_make_year_grid   (Dtr, Etr, ages, tr_years)
+    h <- fit_hp_year_grid     (Dtr, Etr, ages, tr_years)
+    w <- fit_weibull_year_grid(Dtr, Etr, ages, tr_years)
+    models <- list(Gompertz=g, Makeham=m, `Heligman-Pollard`=h, Weibull=w)
+
+    # Training metrics for this fold
+    tr_tbl <- purrr::imap_dfr(models, function(obj, nm){
+      tibble(
+        Segment      = seg_name,
+        Fold_Year    = val_y,
+        Model        = nm,
+        Fold_N_Params= obj$k,
+        Fold_Train_RMSE = weighted_rmse_grid(Dtr, Etr, obj$mhat, eps = eps),
+        Fold_Train_AIC  = AIC_from_nll(obj$nll, obj$k)
+      )
+    })
+
+    # Validation metrics
+    obs_v_age <- obs_age_from(Dv, Ev)
+    val_tbl <- tibble(
+      Model     = names(models),
+      Fold_Val_RMSE = c(
+        safe_rmse(obs_v_age, pred_age_from(g$mhat, Ev)),
+        safe_rmse(obs_v_age, pred_age_from(m$mhat, Ev)),
+        safe_rmse(obs_v_age, pred_age_from(h$mhat, Ev)),
+        safe_rmse(obs_v_age, pred_age_from(w$mhat, Ev))
+      ),
+      Fold_Val_MAE  = c(
+        safe_mae(obs_v_age, pred_age_from(g$mhat, Ev)),
+        safe_mae(obs_v_age, pred_age_from(m$mhat, Ev)),
+        safe_mae(obs_v_age, pred_age_from(h$mhat, Ev)),
+        safe_mae(obs_v_age, pred_age_from(w$mhat, Ev))
+      )
+    )
+
+    tr_tbl %>% left_join(val_tbl, by = "Model")
+  })
+
+  fold_rows
+}
+
+# 5-fold CV for gender
+run_cv5_for_gender <- function(file_path, gender_label){
+  dat <- prepare_data(file_path)
+
+  # 5-fold for each segment
+  folds_list <- purrr::imap(age_segments, ~ fit_one_segment_cv(dat, .y, .x, cv_years = train_years))
+  cv_tbl <- bind_rows(folds_list) %>% mutate(Gender = gender_label, .before = 1)
+
+  # Summary: aggregate 5-fold validation metrics by Gender x Segment x Model
+  cv_summary <- cv_tbl %>%
+    group_by(Gender, Segment, Model) %>%
+    summarise(
+      N_Folds          = dplyr::n(),
+      Mean_Fold_Train_AIC  = mean(Fold_Train_AIC, na.rm = TRUE),
+      Mean_Fold_Train_RMSE = mean(Fold_Train_RMSE, na.rm = TRUE),
+      Mean_Val_RMSE    = mean(Fold_Val_RMSE, na.rm = TRUE),
+      Median_Val_RMSE  = median(Fold_Val_RMSE, na.rm = TRUE),
+      Mean_Val_MAE     = mean(Fold_Val_MAE,  na.rm = TRUE),
+      Median_Val_MAE   = median(Fold_Val_MAE, na.rm = TRUE),
+      SD_Val_RMSE      = sd(Fold_Val_RMSE,   na.rm = TRUE),
+      SD_Val_MAE       = sd(Fold_Val_MAE,    na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Select best model per segment based on Mean_Val_RMSE
+  winners <- cv_summary %>%
+    group_by(Gender, Segment) %>%
+    arrange(Mean_Val_RMSE, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(
+      Gender, Segment, Best_Model_CV = Model,
+      Mean_Val_RMSE, Mean_Val_MAE, SD_Val_RMSE, SD_Val_MAE,
+      Mean_Fold_Train_AIC, Mean_Fold_Train_RMSE
+    )
+
+  list(folds = cv_tbl, summary = cv_summary, best = winners)
+}
+
+# Run and save 5-fold CV
+female_cv <- run_cv5_for_gender(female_file, "Female")
+male_cv   <- run_cv5_for_gender(male_file,   "Male")
+
+cv5_folds   <- bind_rows(female_cv$folds,   male_cv$folds)
+cv5_summary <- bind_rows(female_cv$summary, male_cv$summary)
+cv5_best    <- bind_rows(female_cv$best,    male_cv$best)
+
+cat("\n=== 5-fold: Segment x Model x Fold details (sorted by Fold_Val_RMSE) ===\n")
+print(
+  cv5_folds %>%
+    arrange(Gender, Segment, Fold_Year, Fold_Val_RMSE) %>%
+    mutate(across(c(Fold_Train_RMSE, Fold_Train_AIC, Fold_Val_RMSE, Fold_Val_MAE), ~round(., 6)))
+)
+
+cat("\n=== 5-fold: Summary statistics (sorted by Mean_Val_RMSE) ===\n")
+print(
+  cv5_summary %>%
+    arrange(Gender, Segment, Mean_Val_RMSE) %>%
+    mutate(across(c(Mean_Fold_Train_AIC, Mean_Fold_Train_RMSE,
+                    Mean_Val_RMSE, Median_Val_RMSE, SD_Val_RMSE,
+                    Mean_Val_MAE, Median_Val_MAE, SD_Val_MAE), ~round(., 6)))
+)
+
+cat("\n=== 5-fold: Best model per segment (selected by Mean_Val_RMSE) ===\n")
+print(
+  cv5_best %>%
+    arrange(Gender, Segment) %>%
+    mutate(across(c(Mean_Val_RMSE, Mean_Val_MAE, SD_Val_RMSE, SD_Val_MAE,
+                    Mean_Fold_Train_AIC, Mean_Fold_Train_RMSE), ~round(., 6)))
+)
+
+write_csv(cv5_folds,   "cv5_folds_metrics.csv")
+write_csv(cv5_summary, "cv5_summary_metrics.csv")
+write_csv(cv5_best,    "cv5_segment_best_models.csv")
+```
+
+# Fitting Plots
+
+```{r}
+# Two figures: (1) Observed vs Model Fits  (2) Residuals by age
+# Train: 2013–2017, Test: 2018–2022, Age<=100
+# Models: Gompertz / Makeham / Heligman–Pollard / Weibull
+# Observed uses weighted aggregate: sum(D)/sum(E)
+
+if (!exists("theme_hmd")) {
+  theme_hmd <- ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(),
+      legend.position = "bottom"
+    )
+}
+
+# Map age to segment name
+age_to_segment <- function(a){
+  nm <- names(age_segments)[vapply(age_segments, function(v) a %in% v, logical(1))]
+  if (length(nm)==0) NA_character_ else nm[1]
+}
+
+# Build observed vs predicted data and residuals
+build_fit_resid <- function(file_path, gender_label){
+  dat <- prepare_data(file_path)
+  ages <- dat$ages
+
+  # Fit four models
+  g <- fit_gomp_year_grid   (dat$D_train, dat$E_train, ages, dat$years_tr)
+  m <- fit_make_year_grid   (dat$D_train, dat$E_train, ages, dat$years_tr)
+  h <- fit_hp_year_grid     (dat$D_train, dat$E_train, ages, dat$years_tr)
+  w <- fit_weibull_year_grid(dat$D_train, dat$E_train, ages, dat$years_tr)
+
+  # Test period observed rates by age (exposure-weighted)
+  obs <- rowSums(dat$D_test) / pmax(rowSums(dat$E_test), eps)
+
+  # Predictions (training mhat, averaged over years for test period age rates)
+  pg <- rowMeans(g$mhat)
+  pm <- rowMeans(m$mhat)
+  ph <- rowMeans(h$mhat)
+  pw <- rowMeans(w$mhat)
+
+  fit_df <- tibble(
+    Age = ages,
+    Observed = obs,
+    Gompertz = pg,
+    Makeham  = pm,
+    `Heligman-Pollard` = ph,
+    Weibull  = pw,
+    Gender   = gender_label,
+    Segment  = factor(sapply(ages, age_to_segment), levels = names(age_segments))
+  )
+
+  resid_long <- fit_df %>%
+    pivot_longer(cols = c(Gompertz, Makeham, `Heligman-Pollard`, Weibull),
+                 names_to = "Model", values_to = "Pred") %>%
+    mutate(Residual = Observed - Pred)
+
+  list(fit_df = fit_df, resid_long = resid_long)
+}
+
+# Generate Female / Male data
+female_viz <- build_fit_resid(female_file, "Female")
+male_viz   <- build_fit_resid(male_file,   "Male")
+
+fit_all   <- bind_rows(female_viz$fit_df,   male_viz$fit_df)
+resid_all <- bind_rows(female_viz$resid_long, male_viz$resid_long)
+```
+
+
+```{r}
+# Enhanced Observed vs Model Fits with unified styling and separate saves
+
+# Prepare data
+plot_df <- fit_all %>%
+  select(Age, Gender, `Observed Data` = Observed,
+         Gompertz, Makeham, Weibull, `Heligman-Pollard`) %>%
+  pivot_longer(-c(Age, Gender), names_to = "Series", values_to = "mx") %>%
+  mutate(Series = factor(Series,
+                         levels = c("Gompertz","Makeham","Weibull",
+                                    "Heligman-Pollard","Observed Data")))
+
+# Enhanced color scheme with better contrast
+custom_colors <- c(
+  "Gompertz" = "#F8766D",
+  "Makeham" = "#A9D179",
+  "Weibull" = "#00BFC4",
+  "Heligman-Pollard" = "#C77CFF",
+  "Observed Data" = "black"
+)
+
+# Create enhanced plot function
+create_enhanced_fit_plot <- function(data, gender_filter = NULL, title_suffix = "") {
+  
+  if (!is.null(gender_filter)) {
+    data <- data %>% filter(Gender == gender_filter)
+  }
+  
+  ggplot(data, aes(Age, mx, colour = Series)) +
+    geom_line(linewidth = 1.2, alpha = 0.85) +
+    
+    # Add points to help distinguish overlapping lines
+    geom_point(size = 0.8, alpha = 0.7, 
+               data = data %>% filter(Age %% 5 == 0)) + # Points every 5 years
+    
+    # Enhanced color scale
+    scale_color_manual(
+      values = custom_colors,
+      name = "",
+      guide = guide_legend(
+        override.aes = list(linewidth = 3, alpha = 1),
+        ncol = 5,
+        byrow = TRUE
+      )
+    ) +
+    
+    # Enhanced y-axis with better formatting
+    scale_y_log10(
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      labels = scales::trans_format("log10", scales::math_format(10^.x)),
+      minor_breaks = NULL
+    ) +
+    
+    # Enhanced x-axis
+    scale_x_continuous(
+      breaks = seq(0, max_age, by = 20),
+      expand = c(0.01, 0)
+    ) +
+    
+    # Conditional faceting
+    {if (is.null(gender_filter)) facet_wrap(~ Gender, ncol = 1, scales = "fixed") else NULL} +
+    
+    # Enhanced labels
+    labs(
+      title = paste0("Mortality Model Performance", title_suffix),
+      subtitle = "Observed mortality rates (2018-2022) vs parametric model fits (trained 2013-2017)",
+      x = "Age (years)",
+      y = expression("Mortality rate " * mu[x]),
+      caption = "Log scale used to show patterns across all age ranges"
+    ) +
+    
+    # Unified theme matching other plots
+    theme_minimal(base_size = 14) +
+    theme(
+      # Title styling
+      plot.title = element_text(
+        size = 18, 
+        face = "bold", 
+        hjust = 0.5,
+        margin = margin(b = 5)
+      ),
+      plot.subtitle = element_text(
+        size = 15, 
+        hjust = 0.5, 
+        color = "gray30",
+        margin = margin(b = 15)
+      ),
+      plot.caption = element_text(
+        size = 12, 
+        color = "gray50", 
+        hjust = 0.5,
+        margin = margin(t = 15)
+      ),
+      
+      # Facet styling (if used)
+      strip.text = element_text(
+        size = 15, 
+        margin = margin(b = 10, t = 10)
+      ),
+      strip.background = element_blank(),
+      
+      # Axis styling
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 12),
+      axis.ticks = element_line(color = "gray60", size = 0.4),
+      
+      # Legend styling
+      legend.position = "bottom",
+      legend.title = element_text(size = 13),
+      legend.text = element_text(size = 11),
+      legend.margin = margin(t = 20),
+      legend.key.width = unit(1.5, "cm"),
+      
+      # Panel styling
+      panel.grid.major = element_line(color = "gray90", size = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.border = element_rect(color = "gray60", fill = NA, size = 0.6),
+      
+      # Overall plot styling
+      plot.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(20, 20, 20, 20)
+    )
+}
+
+# Create and save combined plot
+p_fit_combined <- create_enhanced_fit_plot(plot_df)
+print(p_fit_combined)
+ggsave("fitted.png", p_fit_combined, 
+       width = 12, height = 8, dpi = 300, bg = "white")
+
+# Create and save female-only plot
+p_fit_female <- create_enhanced_fit_plot(plot_df, gender_filter = "Female", title_suffix = " - Female")
+print(p_fit_female)
+ggsave("enhanced_model_fits_female.png", p_fit_female, 
+       width = 12, height = 6, dpi = 300, bg = "white")
+
+# Create and save male-only plot  
+p_fit_male <- create_enhanced_fit_plot(plot_df, gender_filter = "Male", title_suffix = " - Male")
+print(p_fit_male)
+ggsave("enhanced_model_fits_male.png", p_fit_male, 
+       width = 12, height = 6, dpi = 300, bg = "white")
+
+```
+
+
+# Residual Boxplots
+
+```{r}
+custom_colors <- c(
+  "Gompertz"         = "#F8766D",
+  "Makeham"          = "#A9D179",
+  "Weibull"          = "#00BFC4",
+  "Heligman-Pollard" = "#C77CFF"
+)
+
+make_resid_box <- function(fit_df, title_prefix = ""){
+  df_box <- fit_df %>%
+    transmute(
+      age_group = create_age_groups(Age),
+      resid_gomp = Observed - Gompertz,
+      resid_make = Observed - Makeham,
+      resid_hp   = Observed - `Heligman-Pollard`,
+      resid_weib = Observed - Weibull
+    ) %>%
+    tidyr::pivot_longer(
+      cols = dplyr::starts_with("resid_"),
+      names_to = "model_raw",
+      values_to = "residual"
+    ) %>%
+    mutate(
+      Model = dplyr::recode(model_raw,
+                            resid_gomp = "Gompertz",
+                            resid_make = "Makeham",
+                            resid_hp   = "Heligman-Pollard",
+                            resid_weib = "Weibull"),
+      AbsRes = abs(residual),
+      Model  = factor(Model, levels = names(custom_colors))
+    )
+
+  ggplot(df_box, aes(x = age_group, y = AbsRes, fill = Model)) +
+    geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = 1) +
+    scale_y_log10() +
+    scale_fill_manual(values = custom_colors) +
+    labs(
+      x = "Age Group",
+      y = "Absolute Residual (log scale)",
+      fill = "Model",
+      title = paste0(title_prefix, ": Absolute residuals by age group")
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom"
+    )
+}
+
+# Generate plots
+p_resid_box_female <- make_resid_box(female_viz$fit_df, "Female")
+p_resid_box_male   <- make_resid_box(male_viz$fit_df,   "Male")
+
+print(p_resid_box_female)
+print(p_resid_box_male)
+```
+
+# Actuarial Present Values
+
+```{r}
+# Age-Segmented Model Selection & Life Insurance Present Value Calculation
+
+# Normalize segment best model column names to Best_Model
+normalize_seg_best <- function(seg_best_tbl, gender = NULL){
+  if (is.null(seg_best_tbl) || nrow(seg_best_tbl) == 0) return(NULL)
+  if (!is.null(gender) && "Gender" %in% names(seg_best_tbl)) {
+    seg_best_tbl <- dplyr::filter(seg_best_tbl, Gender == gender)
+  }
+  nm <- names(seg_best_tbl)
+  cand <- c("Best_Model","Best_Model_CV","Best.Model","Best","Best_Model.tr","Winner","Winner_Model")
+  hit  <- cand[cand %in% nm][1]
+  if (is.na(hit)) return(NULL)
+  names(seg_best_tbl)[match(hit, names(seg_best_tbl))] <- "Best_Model"
+  seg_best_tbl %>%
+    dplyr::select(Segment, Best_Model) %>%
+    dplyr::mutate(Best_Model = dplyr::recode(Best_Model,
+      "Heligman-Pollard" = "Heligman_Pollard"))
+}
+
+# Build robust segment-to-model mapping with fallback defaults
+build_segment_model_map <- function(seg_best_tbl = NULL, gender = NULL){
+  base <- tibble::tibble(
+    Segment = factor(c("Infant (0-1)","Child (2-14)","Youth (15-24)",
+                       "Adult (25-64)","Senior (65-84)","Elderly (85+)"),
+      levels = c("Infant (0-1)","Child (2-14)","Youth (15-24)",
+                 "Adult (25-64)","Senior (65-84)","Elderly (85+)"))
+  )
+  default_map <- function(df){
+    df %>% dplyr::mutate(Best_Model = dplyr::case_when(
+      Segment == "Infant (0-1)"   ~ "Makeham",
+      Segment == "Child (2-14)"   ~ "Gompertz",
+      Segment == "Youth (15-24)"  ~ "Gompertz",
+      Segment == "Adult (25-64)"  ~ "Weibull",
+      Segment == "Senior (65-84)" ~ "Makeham",
+      TRUE                        ~ "Heligman_Pollard"
+    ))
+  }
+  nb <- normalize_seg_best(seg_best_tbl, gender)
+  if (is.null(nb)) return(default_map(base))
+  base %>%
+    dplyr::left_join(nb, by = "Segment") %>%
+    dplyr::mutate(Best_Model = dplyr::coalesce(
+      Best_Model,
+      dplyr::case_when(
+        Segment == "Infant (0-1)"   ~ "Makeham",
+        Segment == "Child (2-14)"   ~ "Gompertz",
+        Segment == "Youth (15-24)"  ~ "Gompertz",
+        Segment == "Adult (25-64)"  ~ "Weibull",
+        Segment == "Senior (65-84)" ~ "Makeham",
+        TRUE                        ~ "Heligman_Pollard"
+      )))
+}
+
+# Return optimal model by age segment with caching for different genders
+.get_model_map_cache <- new.env(parent = emptyenv())
+
+reset_model_map_cache <- function(){
+  rm(list = ls(envir = .get_model_map_cache), envir = .get_model_map_cache)
+}
+
+get_optimal_model_by_age <- function(age, gender = NULL){
+  seg <- as.character(create_age_groups(age))
+  gkey <- if (is.null(gender)) "All" else as.character(gender)
+
+  # Build mapping for this gender if not cached
+  if (!exists(gkey, envir = .get_model_map_cache)) {
+    assign(
+      gkey,
+      build_segment_model_map(
+        seg_best_tbl = if (exists("seg_best")) seg_best else NULL,
+        gender = gender
+      ),
+      envir = .get_model_map_cache
+    )
+  }
+  map_tbl <- get(gkey, envir = .get_model_map_cache)
+  hit <- map_tbl %>% dplyr::filter(as.character(Segment) == seg)
+
+  if (nrow(hit) == 0 || is.na(hit$Best_Model[1])) {
+    # Fallback defaults
+    return(dplyr::case_when(
+      age <= 1  ~ "Makeham",
+      age <= 14 ~ "Gompertz",
+      age <= 24 ~ "Gompertz",
+      age <= 64 ~ "Weibull",
+      age <= 84 ~ "Makeham",
+      TRUE      ~ "Heligman_Pollard"
+    ))
+  }
+  hit$Best_Model[1]
+}
+
+# Helper to safely extract parameters from nested lists
+.get_param <- function(lst, key, name = NULL){
+  if (is.null(lst) || is.null(lst[[key]])) return(NA_real_)
+  v <- lst[[key]]
+  if (!is.null(name)) {
+    return(suppressWarnings(as.numeric(v[[name]])))
+  }
+  return(suppressWarnings(as.numeric(v)))
+}
+
+# Calculate mortality rate μ(x) based on model and parameters
+calculate_mortality_rate <- function(age, model_type, params) {
+  # Default parameters for fallback
+  defaults <- list(
+    gompertz = c(B = 7.5e-6, c = 1.114),
+    makeham  = c(A = 3.03e-4, B = 3.72e-6, c = 1.124),
+    hp       = c(A = 2e-4, B = -0.5, C = 0.01, D = 5, E = 25, F = 1e-5, G = 1.08),
+    weibull  = c(lambda = 0.01, k = 1.5)
+  )
+
+  safe_clip <- function(z) {
+    z <- ifelse(is.finite(z), z, NA_real_)
+    z <- pmax(z, 1e-12)
+    pmin(z, 1.0)
+  }
+
+  tryCatch({
+    switch(model_type,
+      "Gompertz" = {
+        B <- .get_param(params, "gompertz", "B"); if (is.na(B)) B <- defaults$gompertz["B"]
+        c <- .get_param(params, "gompertz", "c"); if (is.na(c)) c <- defaults$gompertz["c"]
+        safe_clip(B * (c^age))
+      },
+      "Makeham" = {
+        A <- .get_param(params, "makeham", "A"); if (is.na(A)) A <- defaults$makeham["A"]
+        B <- .get_param(params, "makeham", "B"); if (is.na(B)) B <- defaults$makeham["B"]
+        c <- .get_param(params, "makeham", "c"); if (is.na(c)) c <- defaults$makeham["c"]
+        safe_clip(A + B * (c^age))
+      },
+      "Heligman_Pollard" = {
+        A <- .get_param(params, "hp", "A"); B <- .get_param(params, "hp", "B")
+        C <- .get_param(params, "hp", "C"); D <- .get_param(params, "hp", "D")
+        E <- .get_param(params, "hp", "E"); F <- .get_param(params, "hp", "F")
+        G <- .get_param(params, "hp", "G")
+        # Fallback to Gompertz if parameters invalid
+        if (any(is.na(c(A,B,C,D,E,F,G))) || A <= 0 || D <= 0 || E <= 0 || G <= 1e-6) {
+          B0 <- defaults$gompertz["B"]; c0 <- defaults$gompertz["c"]
+          return(safe_clip(B0 * (c0^age)))
+        }
+        age1 <- pmax(age, 0.1)
+        term1 <- A^(age1 + B)
+        term2 <- C * exp(-D * (log(age1) - log(E))^2)
+        term3 <- F * (G^age1)
+        safe_clip(term1 + term2 + term3)
+      },
+      "Weibull" = {
+        lambda <- .get_param(params, "weibull", "lambda"); if (is.na(lambda)) lambda <- defaults$weibull["lambda"]
+        k      <- .get_param(params, "weibull", "k");      if (is.na(k))      k      <- defaults$weibull["k"]
+        age1 <- pmax(age, 0.1)
+        safe_clip(lambda * k * (lambda * age1)^(k - 1))
+      },
+      { # default fallback to Gompertz
+        B0 <- defaults$gompertz["B"]; c0 <- defaults$gompertz["c"]
+        safe_clip(B0 * (c0^age))
+      }
+    )
+  }, error = function(e) {
+    B0 <- defaults$gompertz["B"]; c0 <- defaults$gompertz["c"]
+    safe_clip(B0 * (c0^age))
+  })
+}
+
+# Calculate survival probability t_p_x = exp(-∫ μ(s) ds)
+# Uses segment-specific models
+calculate_survival_probability <- function(x, t, params, step_size = 0.5, gender = NULL) {
+  if (t <= 0) return(1)
+  if (t > 50) return(0)
+
+  ages <- seq(x, x + t, by = step_size)
+  if (!isTRUE(abs(tail(ages,1) - (x + t)) < 1e-12)) ages <- c(ages, x + t)
+
+  cum_haz <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1])
+    dt    <- ages[i + 1] - ages[i]
+    
+    model_type <- get_optimal_model_by_age(a_mid, gender = gender)
+    seg_info   <- get_segment_params(a_mid, gender)
+    params_eff <- if (!is.null(seg_info) && seg_info$model == model_type) seg_info$params else params
+    mu_mid     <- calculate_mortality_rate(a_mid, model_type, params_eff)
+
+    cum_haz <- cum_haz + mu_mid * dt
+    if (cum_haz > 60) return(0)
+  }
+  res <- exp(-cum_haz)
+  if (!is.finite(res)) 0 else res
+}
+
+# Single-model survival probability for consistency comparisons
+calculate_survival_probability_single <- function(x, t, params, model_type, step_size = 0.5){
+  if (t <= 0) return(1)
+  ages <- seq(x, x + t, by = step_size)
+  if (!isTRUE(abs(tail(ages,1) - (x + t)) < 1e-12)) ages <- c(ages, x + t)
+  cum_haz <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1])
+    dt    <- ages[i + 1] - ages[i]
+    mu_mid <- calculate_mortality_rate(a_mid, model_type, params)
+    cum_haz <- cum_haz + mu_mid * dt
+    if (cum_haz > 60) return(0)
+  }
+  res <- exp(-cum_haz)
+  if (!is.finite(res)) 0 else res
+}
+
+# Life Insurance Present Value Calculation Functions
+
+calculate_whole_life_insurance_pv <- function(x, params, interest_rate = 0.03, 
+                                              max_age = 100, step_size = 0.5, gender = NULL) {
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, min(max_age, x + 50), by = step_size)
+  pv <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+
+    model_type <- get_optimal_model_by_age(a_mid, gender = gender)
+    seg_info   <- get_segment_params(a_mid, gender)
+    params_eff <- if (!is.null(seg_info) && seg_info$model == model_type) seg_info$params else params
+    mu_t       <- calculate_mortality_rate(a_mid, model_type, params_eff)
+
+    t <- a_mid - x
+    tp <- calculate_survival_probability(x, t, params, step_size = step_size, gender = gender)
+    v <- exp(-delta * t)
+    pv <- pv + v * mu_t * tp * dt
+    if (tp < 1e-8) break
+  }
+  if (!is.finite(pv) || pv < 0) 0.001 else pv
+}
+
+calculate_whole_life_annuity_pv <- function(x, params, interest_rate = 0.03, 
+                                            max_age = 100, step_size = 0.5, gender = NULL) {
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, min(max_age, x + 50), by = step_size)
+  pv <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    t <- a_mid - x
+    tp <- calculate_survival_probability(x, t, params, step_size = step_size, gender = gender)
+    v <- exp(-delta * t)
+    pv <- pv + v * tp * dt
+    if (tp < 1e-8) break
+  }
+  if (!is.finite(pv) || pv <= 0) 1.0 else pv
+}
+
+calculate_term_life_insurance_pv <- function(x, n, params, interest_rate = 0.03, 
+                                             step_size = 0.5, gender = NULL) {
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, x + n, by = step_size)
+  pv <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    model_type <- get_optimal_model_by_age(a_mid, gender = gender)
+    mu_t <- calculate_mortality_rate(a_mid, model_type, params)
+    t <- a_mid - x
+    tp <- calculate_survival_probability(x, t, params, step_size = step_size, gender = gender)
+    v <- exp(-delta * t)
+    pv <- pv + v * mu_t * tp * dt
+  }
+  if (!is.finite(pv) || pv < 0) 0.001 else pv
+}
+
+calculate_term_annuity_pv <- function(x, n, params, interest_rate = 0.03, 
+                                      step_size = 0.5, gender = NULL) {
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, x + n, by = step_size)
+  pv <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    t <- a_mid - x
+    tp <- calculate_survival_probability(x, t, params, step_size = step_size, gender = gender)
+    v <- exp(-delta * t)
+    pv <- pv + v * tp * dt
+  }
+  if (!is.finite(pv) || pv <= 0) 1.0 else pv
+}
+
+# Premium Calculation Functions
+
+calculate_net_annual_premium <- function(x, params, interest_rate = 0.03, 
+                                         insurance_type = "whole_life", n = NULL, gender = NULL) {
+  tryCatch({
+    if (insurance_type == "whole_life") {
+      A_x <- calculate_whole_life_insurance_pv(x, params, interest_rate, gender = gender)
+      a_x <- calculate_whole_life_annuity_pv(x, params, interest_rate,  gender = gender)
+    } else if (insurance_type == "term_life" && !is.null(n)) {
+      A_x <- calculate_term_life_insurance_pv(x, n, params, interest_rate, gender = gender)
+      a_x <- calculate_term_annuity_pv(x, n, params, interest_rate,  gender = gender)
+    } else {
+      stop("Please specify valid insurance type and term")
+    }
+    if (any(!is.finite(c(A_x, a_x))) || a_x <= 0) {
+      return(list(net_premium = NA, insurance_pv = A_x, annuity_pv = a_x, premium_ratio = NA))
+    }
+    net_premium <- A_x / a_x
+    list(net_premium = net_premium, insurance_pv = A_x, annuity_pv = a_x, premium_ratio = net_premium)
+  }, error = function(e) {
+    list(net_premium = NA, insurance_pv = NA, annuity_pv = NA, premium_ratio = NA)
+  })
+}
+
+# Single model comparison using consistent numerical integration
+calculate_single_model_pv <- function(x, params, model_type = "Gompertz", 
+                                      interest_rate = 0.03, max_age = 100, step_size = 0.5) {
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, max_age, by = step_size)
+  ins_pv <- 0; ann_pv <- 0
+  for (i in 1:(length(ages) - 1)) {
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    t <- a_mid - x
+    mu_t <- calculate_mortality_rate(a_mid, model_type, params)
+    tp   <- calculate_survival_probability_single(x, t, params, model_type, step_size)
+    v    <- exp(-delta * t)
+    ins_pv <- ins_pv + v * mu_t * tp * dt
+    ann_pv <- ann_pv + v * tp * dt
+    if (tp < 1e-8) break
+  }
+  list(insurance_pv = ins_pv, annuity_pv = ann_pv, net_premium = ins_pv / ann_pv)
+}
+
+cat("Checking model parameters:\n")
+if (exists("model_res") && !is.null(model_res$params)) {
+  if (!is.null(model_res$params$gompertz)) {
+    cat("Gompertz:", paste(names(model_res$params$gompertz), "=", signif(model_res$params$gompertz, 8)), "\n")
+  }
+  if (!is.null(model_res$params$makeham)) {
+    cat("Makeham :", paste(names(model_res$params$makeham),  "=", signif(model_res$params$makeham,  8)), "\n")
+  }
+  if (!is.null(model_res$params$weibull)) {
+    cat("Weibull :", paste(names(model_res$params$weibull),  "=", signif(model_res$params$weibull,  8)), "\n")
+  }
+  if (!is.null(model_res$params$hp)) {
+    cat("HP      :", paste(names(model_res$params$hp),       "=", signif(model_res$params$hp,       8)), "\n")
+  }
+}
+
+# Build PV data for a vector of ages
+pv_curves_data <- function(age_range = seq(30, 80, by = 5),
+                           params, ir = 0.03, gender = NULL) {
+  purrr::map_dfr(age_range, function(a){
+    r <- calculate_net_annual_premium(
+      x = a, params = params, interest_rate = ir,
+      insurance_type = "whole_life", gender = gender
+    )
+    tibble::tibble(
+      Age = a,
+      Insurance_PV     = as.numeric(r$insurance_pv),
+      Annuity_PV       = as.numeric(r$annuity_pv),
+      Net_Premium_Rate = as.numeric(r$net_premium),
+      Gender = if (is.null(gender)) "All" else gender
+    )
+  })
+}
+
+make_pv_table <- function(ages = c(25, 35, 45, 55, 65, 75),
+                          params, ir = 0.03, term_n = 20, gender = "Female") {
+  purrr::map_dfr(ages, function(a){
+    wl <- calculate_net_annual_premium(a, params, interest_rate = ir,
+                                       insurance_type = "whole_life", gender = gender)
+    tl <- calculate_net_annual_premium(a, params, interest_rate = ir,
+                                       insurance_type = "term_life", n = term_n, gender = gender)
+    tibble::tibble(
+      Age = a,
+      A_x    = signif(wl$insurance_pv, 5),
+      a_x    = signif(wl$annuity_pv, 5),
+      P_net  = signif(wl$net_premium, 5),
+      Ratio  = signif(wl$insurance_pv / wl$annuity_pv, 5),
+      Error  = signif(abs(wl$net_premium - wl$insurance_pv / wl$annuity_pv), 3),
+      Term_A_x   = signif(tl$insurance_pv, 5),
+      Term_a_x   = signif(tl$annuity_pv, 5),
+      Term_P_net = signif(tl$net_premium, 5)
+    )
+  })
+}
+
+pv_table <- make_pv_table(params = model_res$params, ir = 0.03, term_n = 20, gender = "Female")
+print(pv_table)
+
+knitr::kable(pv_table, format = "latex", booktabs = TRUE,
+             caption = "Actuarial present values and validation by entry age (continuous model, $\\delta = 0.03$)")
+
+```
+```{r}
+# PV curves + Net premium rate
+suppressPackageStartupMessages({
+  library(gridExtra)
+})
+
+plot_pv_panels <- function(df, title_prefix = "Age-Segmented Model") {
+  p1 <- ggplot(df, aes(Age)) +
+    geom_line(aes(y = Annuity_PV, colour = "Annuity PV"), linewidth = 1.2) +
+    geom_line(aes(y = Insurance_PV, colour = "Insurance PV"), linewidth = 1.2) +
+    scale_color_manual(values = c("Insurance PV" = "red", "Annuity PV" = "blue"),
+                       name = "Type") +
+    labs(title = paste0(title_prefix, ": Life Insurance and Annuity Present Values by Age"),
+         x = "Age", y = "Present Value") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(hjust = 0.5, size = 11))
+  
+  p2 <- ggplot(df, aes(Age, Net_Premium_Rate)) +
+    geom_line(color = "darkgreen", linewidth = 1.2) +
+    geom_point(color = "darkgreen", size = 2) +
+    labs(title = paste0(title_prefix, ": Net Annual Premium Rate by Age"),
+         x = "Age", y = "Net Annual Premium Rate") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, size = 11))
+  
+  gridExtra::arrangeGrob(p1, p2, ncol = 1)
+}
+
+# Generate separate figures for male and female
+pv_f <- pv_curves_data(seq(20, 80, by = 5), params = model_res$params, ir = 0.03, gender = "Female")
+pv_m <- pv_curves_data(seq(20, 80, by = 5), params = model_res$params, ir = 0.03, gender = "Male")
+
+g_f <- plot_pv_panels(pv_f, "Age-Segmented Model")
+g_m <- plot_pv_panels(pv_m, "Age-Segmented Model")
+
+grid::grid.newpage(); grid::grid.draw(g_f)
+grid::grid.newpage(); grid::grid.draw(g_m)
+```
+
+# Life Table Comparison
+
+```{r}
+# APV based on life table μ(age) for comparison with model estimates
+
+build_lifetable_mu_fun <- function(file_path, years = test_years, max_age = 100){
+  df <- readr::read_table2(
+    file_path, skip = 2,
+    col_types = cols(
+      Year = col_integer(), Age = col_character(), mx = col_double(),
+      qx = col_double(), ax = col_double(), lx = col_double(),
+      dx = col_double(), Lx = col_double(), Tx = col_double(), ex = col_double()
+    )
+  ) %>%
+    dplyr::mutate(Age = readr::parse_number(Age)) %>%
+    dplyr::filter(Age <= max_age, Year %in% years)
+
+  lt <- df %>%
+    dplyr::group_by(Age) %>%
+    dplyr::summarise(qx = mean(pmin(pmax(qx, 0), 0.999999), na.rm = TRUE), .groups = "drop")
+
+  mu_tbl <- tibble::tibble(Age = 0:max_age) %>%
+    dplyr::left_join(lt, by = "Age") %>%
+    dplyr::mutate(
+      qx = ifelse(is.finite(qx), qx, 0),
+      mu = -log(pmax(1 - qx, 1e-12))
+    )
+
+  # Return function: given continuous age a, take floor(a) corresponding μ (piecewise constant)
+  function(a){
+    k <- pmin(pmax(floor(a), 0), max_age)
+    mu_tbl$mu[mu_tbl$Age == k]
+  }
+}
+
+calculate_survival_probability_lifetable <- function(x, t, mu_fun, step_size = 0.5){
+  if (t <= 0) return(1)
+  ages <- seq(x, x + t, by = step_size); if (tail(ages, 1) < x + t) ages <- c(ages, x + t)
+  cum <- 0
+  for (i in 1:(length(ages) - 1)){
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    cum <- cum + mu_fun(a_mid) * dt
+    if (cum > 60) return(0)
+  }
+  exp(-cum)
+}
+
+calculate_whole_life_insurance_pv_lifetable <- function(x, mu_fun, interest_rate = 0.03,
+                                                        max_age = 100, step_size = 0.5){
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, min(max_age, x + 50), by = step_size)
+  pv <- 0
+  for (i in 1:(length(ages) - 1)){
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    t <- a_mid - x
+    tp <- calculate_survival_probability_lifetable(x, t, mu_fun, step_size)
+    pv <- pv + exp(-delta * t) * mu_fun(a_mid) * tp * dt
+    if (tp < 1e-8) break
+  }
+  pv
+}
+
+calculate_whole_life_annuity_pv_lifetable <- function(x, mu_fun, interest_rate = 0.03,
+                                                      max_age = 100, step_size = 0.5){
+  delta <- log(1 + interest_rate)
+  ages <- seq(x, min(max_age, x + 50), by = step_size)
+  pv <- 0
+  for (i in 1:(length(ages) - 1)){
+    a_mid <- 0.5 * (ages[i] + ages[i + 1]); dt <- ages[i + 1] - ages[i]
+    t <- a_mid - x
+    tp <- calculate_survival_probability_lifetable(x, t, mu_fun, step_size)
+    pv <- pv + exp(-delta * t) * tp * dt
+    if (tp < 1e-8) break
+  }
+  pv
+}
+
+compare_model_vs_lifetable <- function(ages_to_check = seq(20, 80, by = 5),
+                                       ir = 0.03){
+  muF <- build_lifetable_mu_fun(female_file, years = test_years)
+  muM <- build_lifetable_mu_fun(male_file,   years = test_years)
+
+  # Use model_res$params if available, otherwise defaults
+  base_params <- if (exists("model_res") && !is.null(model_res$params)) model_res$params else {
+    list(gompertz = c(B = 7.5e-6, c = 1.114),
+         makeham  = c(A = 3.03e-4, B = 3.72e-6, c = 1.124),
+         hp       = c(A = 2e-4, B = -0.5, C = 0.01, D = 5, E = 25, F = 1e-5, G = 1.08),
+         weibull  = c(lambda = 0.01, k = 1.5))
+  }
+
+  purrr::map_dfr(c("Female","Male"), function(g){
+    mu_fun <- if (g == "Female") muF else muM
+    purrr::map_dfr(ages_to_check, function(x){
+      # Model (segment winners + segment parameters)
+      r_model <- calculate_net_annual_premium(
+        x = x, params = base_params, interest_rate = ir,
+        insurance_type = "whole_life", gender = g
+      )
+      A_mod <- as.numeric(r_model$insurance_pv)
+      a_mod <- as.numeric(r_model$annuity_pv)
+      P_mod <- as.numeric(r_model$net_premium)
+
+      # Life table
+      A_lt <- calculate_whole_life_insurance_pv_lifetable(x, mu_fun, ir)
+      a_lt <- calculate_whole_life_annuity_pv_lifetable(x, mu_fun, ir)
+      P_lt <- A_lt / a_lt
+
+      tibble::tibble(
+        Gender = g, Age = x,
+        A_model = A_mod, a_model = a_mod, P_model = P_mod,
+        A_lt = A_lt,     a_lt = a_lt,     P_lt = P_lt,
+        rel_err_A = (A_mod - A_lt) / A_lt,
+        rel_err_a = (a_mod - a_lt) / a_lt,
+        rel_err_P = (P_mod - P_lt) / P_lt
+      )
+    })
+  }) -> cmp_tbl
+
+  readr::write_csv(cmp_tbl, "apv_model_vs_lifetable.csv")
+  message('Exported: "apv_model_vs_lifetable.csv"')
+  cmp_tbl
+}
+
+# Run comparison and print percentage errors
+cmp <- compare_model_vs_lifetable()
+print(
+  cmp %>% dplyr::mutate(
+    rel_err_A = scales::percent(rel_err_A, accuracy = 0.1),
+    rel_err_a = scales::percent(rel_err_a, accuracy = 0.1),
+    rel_err_P = scales::percent(rel_err_P, accuracy = 0.1)
+  )
+)
+```
+
+# Copula Heatmaps
+
+```{r}
+# Pre-compute H for a given gender with boundary interpolation
+precompute_H_gender <- function(max_age=100, step=0.5, gender=NULL, params=list()){
+  a_edges <- seq(0, max_age, by = step)
+  a_mids  <- (a_edges[-1] + a_edges[-length(a_edges)]) / 2
+  mu_mid  <- vapply(a_mids, function(a){
+    mdl <- get_optimal_model_by_age(a, gender = gender)
+    si  <- get_segment_params(a, gender)
+    pff <- if (!is.null(si) && si$model == mdl) si$params else params
+    calculate_mortality_rate(a, mdl, pff)
+  }, numeric(1))
+  H_edges <- c(0, cumsum(mu_mid * diff(a_edges)))
+  # Return interpolator function (supports vector input)
+  H_interp <- function(z) approx(a_edges, H_edges, z, rule = 2)$y
+  list(edges = a_edges, H_edges = H_edges, H = H_interp)
+}
+
+# Generate entire S matrix from H (rows=age vector, cols=time vector)
+survival_matrix_from_H <- function(ages_vec, t_vec, Hobj){
+  Hx0 <- Hobj$H(ages_vec)                                   # length nx
+  Hxt <- outer(ages_vec, t_vec, function(a,t) Hobj$H(a+t))  # nx x L
+  exp(-(Hxt - matrix(Hx0, nrow=length(ages_vec), ncol=length(t_vec))))
+}
+
+# Vectorized generation of all τ A_joint/A_last matrices
+clayton_surfaces_fast <- function(
+  ages_x, ages_y, taus, ir=0.03, step=0.5, max_age=100,
+  gender_x="Female", gender_y="Male", params=list()
+){
+  delta <- log(1+ir)
+  tmax  <- max(0, min(max_age - min(ages_x), max_age - min(ages_y), 50))
+  tg    <- seq(0, tmax, by = step); if (tail(tg,1) < tmax) tg <- c(tg, tmax)
+  dt    <- diff(tg)
+  tm    <- (tg[-1] + tg[-length(tg)]) / 2
+  w     <- delta * exp(-delta * tm) * dt                    # weights δ v(t) Δt
+
+  # Pre-compute H and entire survival matrices (greatly reduces repeated computation)
+  Hx <- precompute_H_gender(max_age, step, gender_x, params)
+  Hy <- precompute_H_gender(max_age, step, gender_y, params)
+  Sx <- survival_matrix_from_H(ages_x, tm, Hx)              # nx x L
+  Sy <- survival_matrix_from_H(ages_y, tm, Hy)              # ny x L
+
+  nx <- length(ages_x); ny <- length(ages_y); L <- length(tm)
+  K  <- length(taus)
+  Aj_list <- vector("list", K)
+  Al_list <- vector("list", K)
+
+  for (k in seq_len(K)) {
+    tau <- taus[k]
+    sum_joint <- matrix(0.0, nrow=nx, ncol=ny)
+    sum_last  <- matrix(0.0, nrow=nx, ncol=ny)
+
+    if (abs(tau) < 1e-12) {
+      # Independent: Sxy = u %o% v
+      for (t in seq_len(L)) {
+        u <- Sx[,t]; v <- Sy[,t]
+        Sxy_t  <- u %o% v
+        Smax_t <- outer(u, rep(1,ny)) + outer(rep(1,nx), v) - Sxy_t
+        sum_joint <- sum_joint + w[t] * Sxy_t
+        sum_last  <- sum_last  + w[t] * pmin(1, pmax(0, Smax_t))
+      }
+    } else {
+      tau   <- max(min(tau, 0.99), 0)               
+      theta <- 2 * tau / (1 - tau)
+      for (t in seq_len(L)) {
+        u <- pmax(Sx[,t], 1e-12); v <- pmax(Sy[,t], 1e-12)
+        u_pow <- u^(-theta); v_pow <- v^(-theta)
+        # Reuse matrix copies to avoid outer product twice
+        Sxy_t <- (matrix(u_pow, nrow=nx, ncol=ny) +
+                  matrix(v_pow, nrow=nx, ncol=ny, byrow=TRUE) - 1)^(-1/theta)
+        Sxy_t[!is.finite(Sxy_t)] <- 0
+        Sxy_t  <- pmin(pmax(Sxy_t, 0), 1)
+        Smax_t <- outer(u, rep(1,ny)) + outer(rep(1,nx), v) - Sxy_t
+        sum_joint <- sum_joint + w[t] * Sxy_t
+        sum_last  <- sum_last  + w[t] * pmin(1, pmax(0, Smax_t))
+      }
+    }
+    Aj_list[[k]] <- 1 - sum_joint
+    Al_list[[k]] <- 1 - sum_last
+  }
+
+  list(A_joint=Aj_list, A_last=Al_list, taus=taus, ages_x=ages_x, ages_y=ages_y)
+}
+
+# Generate three figures using fast surfaces
+ages_grid_het <- if (exists("ages_grid")) ages_grid else seq(30, 80, by = 4)
+taus_het      <- if (exists("taus"))      taus      else c(0, 0.3, 0.5, 0.7)
+ir_het        <- if (exists("ir_val"))    ir_val    else 0.03
+step_het      <- if (exists("step_val"))  step_val  else 0.5
+max_age_het   <- if (exists("max_age_val")) max_age_val else 100
+tau_ref_het   <- if (exists("tau_ref"))   tau_ref   else 0.5
+
+surf_fast <- clayton_surfaces_fast(
+  ages_x = ages_grid_het, ages_y = ages_grid_het, taus = taus_het,
+  ir = ir_het, step = step_het, max_age = max_age_het,
+  gender_x = "Female", gender_y = "Male", params = list()
+)
+```
+
+
+
+
+
+
+
+```{r}
+# Dependency impact table
+.interp2 <- function(M, x_grid, y_grid, xf, yf){
+  xf <- pmin(pmax(xf, min(x_grid)), max(x_grid))
+  yf <- pmin(pmax(yf, min(y_grid)), max(y_grid))
+  i1 <- findInterval(xf, x_grid, rightmost.closed = TRUE)
+  i2 <- pmin(i1 + 1, length(x_grid))
+  x0 <- x_grid[i1]; x1 <- x_grid[i2]; sx <- ifelse(x1 == x0, 0, (xf - x0)/(x1 - x0))
+  j1 <- findInterval(yf, y_grid, rightmost.closed = TRUE)
+  j2 <- pmin(j1 + 1, length(y_grid))
+  y0 <- y_grid[j1]; y1 <- y_grid[j2]; sy <- ifelse(y1 == y0, 0, (yf - y0)/(y1 - y0))
+  f00 <- M[cbind(i1, j1)]; f10 <- M[cbind(i2, j1)]
+  f01 <- M[cbind(i1, j2)]; f11 <- M[cbind(i2, j2)]
+  (1 - sx)*(1 - sy)*f00 + sx*(1 - sy)*f10 + (1 - sx)*sy*f01 + sx*sy*f11
+}
+
+build_dependency_impact_table <- function(surf, pairs = tibble::tribble(
+                                            ~Male, ~Female,
+                                            40,     38,
+                                            50,     50),
+                                          taus_show = c(0.3, 0.5)){
+  # locate the independence surface
+  k0 <- which.min(abs(surf$taus - 0))
+  if (!length(k0)) stop("τ=0 not found in surf_fast$taus")
+
+  # extract premiums for a pair at a given tau
+  get_prem_at <- function(tau, m_age, f_age){
+    k <- which.min(abs(surf$taus - tau))
+    Aj <- .interp2(surf$A_joint[[k]], surf$ages_x, surf$ages_y, f_age, m_age)
+    Al <- .interp2(surf$A_last [[k]], surf$ages_x, surf$ages_y, f_age, m_age)
+    c(Joint = Aj, Last = Al)
+  }
+
+  out <- purrr::map_dfr(seq_len(nrow(pairs)), function(r){
+    m <- pairs$Male[r]; f <- pairs$Female[r]
+    base <- get_prem_at(0, m, f)
+    purrr::map_dfr(taus_show, function(tau){
+      lev  <- get_prem_at(tau, m, f)
+      pct  <- 100 * (lev - base) / pmax(base, 1e-12)
+      tibble::tibble(
+        `Age Pair` = sprintf("%dM–%dF", m, f),
+        Product    = c("Joint-life", "Last-survivor"),
+        tau        = tau,
+        `% Change` = as.numeric(pct),
+        Dir        = ifelse(pct < 0, "\\(\\downarrow\\)", "\\(\\uparrow\\)")
+      )
+    })
+  })
+
+  # reshape columns to match the style in your figure
+  out %>%
+    dplyr::mutate(tau = factor(tau, levels = sort(unique(taus_show)))) %>%
+    dplyr::arrange(`Age Pair`, Product, tau) %>%
+    tidyr::pivot_wider(
+      id_cols   = c(`Age Pair`, Product),
+      names_from = tau,
+      values_from = c(`% Change`, Dir),
+      names_glue = "tau={tau} {.value}"
+    ) %>%
+    dplyr::mutate(
+      `tau = 0.3 % Change` = sprintf("%.1f", `tau=0.3 % Change`),
+      `tau = 0.5 % Change` = sprintf("%.1f", `tau=0.5 % Change`)
+    ) %>%
+    dplyr::select(`Age Pair`, Product,
+                  `tau = 0.3 % Change`, `tau=0.3 Dir`,
+                  `tau = 0.5 % Change`, `tau=0.5 Dir`) -> dep_tbl
+
+  print(
+    knitr::kable(dep_tbl, format = "latex", booktabs = TRUE, align = "llrcrc",
+      caption = "Percentage change in premiums relative to independence ($\\tau=0$) for selected age pairs and dependence levels. Negative values reduce joint-life premiums; positive values increase last-survivor premiums.",
+      col.names = c("Age Pair","Product","% Change","Dir.","% Change","Dir.")
+    )
+  )
+  readr::write_csv(dep_tbl, "dependency_impact_table.csv")
+  dep_tbl
+}
+
+# Example table
+age_pairs <- tibble::tribble(~Male, ~Female, 40, 38, 50, 50)
+dep_tbl   <- build_dependency_impact_table(surf_fast, pairs = age_pairs, taus_show = c(0.3, 0.5))
+
+
+build_dependency_levels_table <- function(surf, pairs, taus_show = c(0, 0.3, 0.5)){
+  get_prem_at <- function(tau, m_age, f_age){
+    k <- which.min(abs(surf$taus - tau))
+    Aj <- .interp2(surf$A_joint[[k]], surf$ages_x, surf$ages_y, f_age, m_age)
+    Al <- .interp2(surf$A_last [[k]], surf$ages_x, surf$ages_y, f_age, m_age)
+    tibble::tibble(tau = tau, `Joint-life` = Aj, `Last-survivor` = Al)
+  }
+  out <- purrr::map_dfr(seq_len(nrow(pairs)), function(r){
+    m <- pairs$Male[r]; f <- pairs$Female[r]
+    purrr::map_dfr(taus_show, ~get_prem_at(.x, m, f)) %>%
+      tidyr::pivot_longer(-tau, names_to = "Product", values_to = "Premium") %>%
+      dplyr::mutate(`Age Pair` = sprintf("%dM–%dF", m, f))
+  })
+  levels_tbl <- out %>%
+    tidyr::pivot_wider(id_cols = c(`Age Pair`, Product),
+                       names_from = tau, values_from = Premium,
+                       names_glue = "tau={tau}") %>%
+    dplyr::mutate(
+      `tau=0`   = sprintf("%.4f", `tau=0`),
+      `tau=0.3` = sprintf("%.4f", `tau=0.3`),
+      `tau=0.5` = sprintf("%.4f", `tau=0.5`)
+    ) %>%
+    dplyr::arrange(`Age Pair`, Product)
+
+  print(
+    knitr::kable(levels_tbl, format = "latex", booktabs = TRUE, align = "llrrr",
+      caption = "Net single premiums under independence and two dependent cases (Clayton copula).",
+      col.names = c("Age Pair","Product","$\\tau=0$","$\\tau=0.3$","$\\tau=0.5$")
+    )
+  )
+  readr::write_csv(levels_tbl, "dependency_levels_table.csv")
+  levels_tbl
+}
+
+levels_tbl <- build_dependency_levels_table(surf_fast, pairs = age_pairs,
+                                            taus_show = c(0, 0.3, 0.5))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+# Plot 1: Enhanced premium heatmap
+heat_df_cl_het <- purrr::map_dfr(seq_along(surf_fast$taus), function(k){
+  Aj <- surf_fast$A_joint[[k]]; Al <- surf_fast$A_last[[k]]
+  tibble::tibble(
+    x = rep(surf_fast$ages_x, times = length(surf_fast$ages_y)),
+    y = rep(surf_fast$ages_y, each  = length(surf_fast$ages_x)),
+    tau = surf_fast$taus[k],
+    A_joint = c(Aj), A_last = c(Al)
+  )
+}) %>%
+  tidyr::pivot_longer(c(A_joint, A_last), names_to = "Type", values_to = "Premium") %>%
+  dplyr::mutate(
+    Type = dplyr::recode(Type, A_joint = "Joint-Life Insurance", A_last = "Last-Survivor Insurance"),
+    tau_label = factor(tau, levels = taus_het,
+                       labels = paste0("τ = ", taus_het) |> (\(s){ s[seq_along(taus_het)] })()),
+    tau_label = forcats::fct_relabel(tau_label, ~ sub("τ = 0$", "τ = 0", .x))
+  )
+
+p_heat_cl_het <- ggplot(heat_df_cl_het, aes(x, y, fill = Premium)) +
+  geom_tile(color = "white", size = 0.1) + 
+  coord_equal() +
+  
+  scale_fill_viridis_c(
+    option = "plasma", 
+    trans = "log10",
+    name = "Net Single\nPremium (A)",
+    labels = scales::number_format(accuracy = 0.001),
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 15,
+      barheight = 1,
+      frame.colour = "black",
+      ticks.colour = "black"
+    )
+  ) +
+  
+  scale_x_continuous(
+    breaks = seq(min(heat_df_cl_het$x), max(heat_df_cl_het$x), by = 10),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = seq(min(heat_df_cl_het$y), max(heat_df_cl_het$y), by = 10),
+    expand = c(0, 0)
+  ) +
+  
+  facet_grid(Type ~ tau_label) +
+  
+  labs(
+    title = "Net Single Premium Analysis by Dependence Structure",
+    subtitle = "Clayton copula model comparing Joint-Life vs Last-Survivor insurance",
+    x = "Female Age",
+    y = "Male Age",
+    caption = "Higher premiums shown in brighter colors (log scale)"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 15, hjust = 0.5, color = "gray30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 12, color = "gray50", hjust = 0.5, margin = margin(t = 15)),
+    
+    strip.text = element_text(size = 15, margin = margin(b = 10, t = 10)),
+    strip.background = element_blank(),
+    
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.ticks = element_line(color = "gray60", size = 0.4),
+    
+    legend.position = "bottom",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11),
+    legend.margin = margin(t = 20),
+    
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(color = "gray60", fill = NA, size = 0.6),
+    panel.spacing = unit(1.2, "lines"),
+    
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+print(p_heat_cl_het)
+ggsave("unified_premium_heatmap.png", p_heat_cl_het, width = 14, height = 8, dpi = 300, bg = "white")
+
+
+# Plot 2: Enhanced deviation plot (unified style)
+k0  <- which.min(abs(surf_fast$taus - 0))
+kref<- which.min(abs(surf_fast$taus - tau_ref_het))
+Aj0 <- surf_fast$A_joint[[k0]];  Al0 <- surf_fast$A_last[[k0]]
+Ajr <- surf_fast$A_joint[[kref]]; Alr <- surf_fast$A_last[[kref]]
+
+dev_signed_df <- tibble::tibble(
+  x = rep(surf_fast$ages_x, times = length(surf_fast$ages_y)),
+  y = rep(surf_fast$ages_y, each  = length(surf_fast$ages_x)),
+  `Joint-Life Insurance`    = 100 * (c(Aj0) - c(Ajr)) / pmax(c(Ajr), 1e-12),
+  `Last-Survivor Insurance` = 100 * (c(Al0) - c(Alr)) / pmax(c(Alr), 1e-12)
+) %>%
+  tidyr::pivot_longer(-c(x,y), names_to = "Panel", values_to = "Deviation")
+
+lim_dev <- max(abs(dev_signed_df$Deviation), na.rm = TRUE)
+lim_dev <- ceiling(lim_dev/5)*5
+
+p_dev_cl_het <- ggplot(dev_signed_df, aes(x, y, fill = Deviation)) +
+  geom_tile(color = "white", size = 0.1) + 
+  coord_equal() +
+  
+  scale_fill_gradient2(
+    low = "#2166ac", 
+    mid = "#f7f7f7", 
+    high = "#b2182b",
+    midpoint = 0, 
+    limits = c(-lim_dev, lim_dev),
+    name = "Pricing Error (%)",
+    labels = function(x) paste0(ifelse(x > 0, "+", ""), x, "%"),
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 15,
+      barheight = 1,
+      frame.colour = "black",
+      ticks.colour = "black"
+    )
+  ) +
+  
+  scale_x_continuous(
+    breaks = seq(min(dev_signed_df$x), max(dev_signed_df$x), by = 10),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = seq(min(dev_signed_df$y), max(dev_signed_df$y), by = 10),
+    expand = c(0, 0)
+  ) +
+  
+  facet_wrap(~ Panel, nrow = 1) +
+  
+  labs(
+    title = "Premium Pricing Errors Under Independence Assumption",
+    subtitle = expression(paste("Percentage deviation from dependent model with τ = 0.5")),
+    x = "Female Age",
+    y = "Male Age",
+    caption = "Red indicates overpricing, blue indicates underpricing under independence assumption"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 15, hjust = 0.5, color = "gray30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 12, color = "gray50", hjust = 0.5, margin = margin(t = 15)),
+    
+    strip.text = element_text(size = 15, margin = margin(b = 10, t = 10)),
+    strip.background = element_blank(),
+    
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.ticks = element_line(color = "gray60", size = 0.4),
+    
+    legend.position = "bottom",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11),
+    legend.margin = margin(t = 20),
+    
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(color = "gray60", fill = NA, size = 0.6),
+    panel.spacing = unit(1.2, "lines"),
+    
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+print(p_dev_cl_het)
+ggsave("unified_premium_deviation.png", p_dev_cl_het, width = 14, height = 7, dpi = 300, bg = "white")
+
+
+# Plot 3: Enhanced signed delta plot (unified style)
+signed_df_het <- tibble::tibble(
+  x = rep(surf_fast$ages_x, times = length(surf_fast$ages_y)),
+  y = rep(surf_fast$ages_y, each  = length(surf_fast$ages_x)),
+  `Joint-Life Insurance`    = c(Aj0) - c(Ajr),
+  `Last-Survivor Insurance` = c(Al0) - c(Alr)
+) %>%
+  tidyr::pivot_longer(-c(x,y), names_to = "Panel", values_to = "Delta")
+
+lim_het <- max(abs(signed_df_het$Delta), na.rm = TRUE)
+
+p_signed_het <- ggplot(signed_df_het, aes(x, y, fill = Delta)) +
+  geom_tile(color = "white", size = 0.1) + 
+  coord_equal() +
+  
+  scale_fill_gradient2(
+    low = "#2166ac", 
+    mid = "#f7f7f7", 
+    high = "#b2182b",
+    midpoint = 0, 
+    limits = c(-lim_het, lim_het),
+    name = expression(Delta*A),
+    labels = scales::number_format(accuracy = 0.001, style_positive = "plus"),
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 15,
+      barheight = 1,
+      frame.colour = "black",
+      ticks.colour = "black"
+    )
+  ) +
+  
+  scale_x_continuous(
+    breaks = seq(min(signed_df_het$x), max(signed_df_het$x), by = 10),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = seq(min(signed_df_het$y), max(signed_df_het$y), by = 10),
+    expand = c(0, 0)
+  ) +
+  
+  facet_wrap(~ Panel, nrow = 1) +
+  
+  labs(
+    title = "Impact of Independence Assumption on Insurance Premiums",
+    subtitle = expression(paste("Signed difference: ", Delta, "A = A"[independent], " - A"[dependent], 
+                                " (", tau[ref], " = 0.5)")),
+    x = "Female Age",
+    y = "Male Age",
+    caption = "Positive values indicate overpricing under independence assumption"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 15, hjust = 0.5, color = "gray30", margin = margin(b = 15)),
+    plot.caption = element_text(size = 12, color = "gray50", hjust = 0.5, margin = margin(t = 15)),
+    
+    strip.text = element_text(size = 15, margin = margin(b = 10, t = 10)),
+    strip.background = element_blank(),
+    
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.ticks = element_line(color = "gray60", size = 0.4),
+    
+    legend.position = "bottom",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11),
+    legend.margin = margin(t = 20),
+    
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(color = "gray60", fill = NA, size = 0.6),
+    panel.spacing = unit(1.2, "lines"),
+    
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+print(p_signed_het)
+ggsave("unified_signed_delta_heatmap.png", p_signed_het, width = 14, height = 7, dpi = 300, bg = "white")
+```
